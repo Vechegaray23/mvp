@@ -1,5 +1,5 @@
 // index.js
-// Twilio Media Streams <-> OpenAI Realtime (Speech-to-Speech) con transcripciones completas
+// Twilio Media Streams <-> OpenAI Realtime (speech-to-speech) con transcripción completa en JSON
 // Ejecuta: node index.js
 // Requisitos: Node 18+, @fastify/websocket, @fastify/formbody, ws, dotenv
 
@@ -12,18 +12,9 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// ───────────────────────────────────────────────────────────────────────────────
 // Carga .env
 dotenv.config();
-const envResult = dotenv.config({ debug: true, override: true });
-console.log('dotenv.config() →', envResult);
-console.log(
-  'API key cargada →',
-  process.env.OPENAI_API_KEY?.slice(0, 10),
-  '…len=',
-  process.env.OPENAI_API_KEY?.length
-);
-
-// Variables de entorno
 const { OPENAI_API_KEY } = process.env;
 const PORT = process.env.PORT || 5050;
 
@@ -40,21 +31,17 @@ const TRANSCRIPTS_DIR = path.join(__dirname, 'transcripts');
 if (!fs.existsSync(TRANSCRIPTS_DIR)) fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
 
 // Utilidades
-function nowIso() { return new Date().toISOString(); }
+const nowIso = () => new Date().toISOString();
+const newSessionId = () => `S_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-// Inicializa Fastify
-const fastify = Fastify();
-fastify.register(fastifyFormBody);
-fastify.register(fastifyWs);
-
+// ───────────────────────────────────────────────────────────────────────────────
 // Configuración del asistente
-const VOICE = 'alloy'; // usa un slug válido de voz
+const VOICE = 'alloy'; // slug válido de voz
 const SYSTEM_MESSAGE =
-  'Eres un asistente que siempre habla español de Chile, claro y directo. ' +
-  'Haz solo una pregunta a la vez y sigue el flujo definido por el sistema. ' +
-  'Evita bromas si el usuario no las solicita.';
+  'Eres un asistente que habla español de Chile, claro y directo. ' +
+  'Haz solo una pregunta a la vez y sigue el flujo definido por el sistema.';
 
-// Eventos a loguear (útil para depurar)
+// Eventos a loguear (para depurar; no imprime el contenido de transcript)
 const LOG_EVENT_TYPES = [
   'error',
   'rate_limits.updated',
@@ -79,6 +66,12 @@ const LOG_EVENT_TYPES = [
 // Opcional: mostrar cálculos de timing para truncation
 const SHOW_TIMING_MATH = false;
 
+// ───────────────────────────────────────────────────────────────────────────────
+// Fastify
+const fastify = Fastify();
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
+
 // Root
 fastify.get('/', async (_req, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
@@ -99,6 +92,7 @@ fastify.all('/incoming-call', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
+// ───────────────────────────────────────────────────────────────────────────────
 // WebSocket de Media Streams (Twilio)
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
@@ -106,7 +100,10 @@ fastify.register(async (fastify) => {
 
     // Estado por conexión
     let streamSid = null;
-    let callSid = null;
+    let callSid = null;                 // llegará en 'start' desde Twilio
+    let sessionId = newSessionId();     // fallback si no hay callSid (se reemplaza cuando llegue)
+    let callStartedAt = null;
+    let callEndedAt = null;
 
     let latestMediaTimestamp = 0;
     let lastAssistantItem = null; // para conversation.item.truncate
@@ -117,32 +114,38 @@ fastify.register(async (fastify) => {
     const transcript = []; // [{ts, role, text, source, ids...}]
     const assistantOutText = new Map(); // response_id -> texto (fallback)
     const assistantOutAudioTranscript = new Map(); // response_id -> transcript alineado al audio
+    const stats = { userTurns: 0, assistantTurns: 0 };
+
+    const basePath = () => path.join(TRANSCRIPTS_DIR, `${callSid || sessionId}`);
 
     const pushLine = (role, text, source, ids = {}) => {
       if (!text) return;
       const line = { ts: nowIso(), role, text, source, ...ids };
       transcript.push(line);
-      console.log(`[TRANSCRIPT][${role}]`, text);
-      // Persistencia incremental opcional:
-      persistTranscriptIfReady();
+      if (role === 'user') stats.userTurns += 1;
+      if (role === 'assistant') stats.assistantTurns += 1;
+      // No imprimir contenido en consola para evitar ruido.
     };
 
-    const persistTranscriptIfReady = () => {
-      if (!callSid) return;
-      const base = path.join(TRANSCRIPTS_DIR, `${callSid}`);
+    const persistTranscript = (final = false) => {
+      const startedAt = callStartedAt ? callStartedAt.toISOString() : (transcript[0]?.ts || nowIso());
+      const endedAt = final ? (callEndedAt ? callEndedAt.toISOString() : nowIso()) : null;
+      const durationMs = (callStartedAt && callEndedAt) ? (callEndedAt - callStartedAt) : null;
+
+      const payload = {
+        callSid: callSid || null,
+        streamSid: streamSid || null,
+        startedAt,
+        endedAt,
+        durationMs,
+        stats,
+        messages: transcript   // [{ts, role, text, source, item_id/response_id...}]
+      };
+
       try {
-        const jsonl = transcript.map(o => JSON.stringify(o)).join('\n') + '\n';
-        fs.writeFileSync(`${base}.jsonl`, jsonl, 'utf8');
-
-        const txt = transcript
-          .map(o => `[${o.ts}] ${o.role.toUpperCase()}: ${o.text}`)
-          .join('\n') + '\n';
-        fs.writeFileSync(`${base}.txt`, txt, 'utf8');
-
-        // Comentario de estado:
-        // console.log(`[TRANSCRIPT] actualizado → ${base}.txt / .jsonl`);
+        fs.writeFileSync(`${basePath()}.json`, JSON.stringify(payload, null, 2), 'utf8');
       } catch (e) {
-        console.error('Error escribiendo transcript:', e);
+        console.error('Error escribiendo transcript JSON:', e);
       }
     };
 
@@ -177,12 +180,11 @@ fastify.register(async (fastify) => {
           // Activar transcripción de ENTRADA (usuario)
           input_audio_transcription: {
             model: 'gpt-4o-mini-transcribe', // o 'whisper-1' / 'gpt-4o-transcribe'
-            language: 'es' // ayuda al reconocimiento en español
+            language: 'es'
           }
         }
       };
 
-      console.log('Sending session update:', JSON.stringify(sessionUpdate));
       if (openAiWs.readyState === WebSocket.OPEN) {
         openAiWs.send(JSON.stringify(sessionUpdate));
       }
@@ -211,7 +213,9 @@ fastify.register(async (fastify) => {
     const handleSpeechStartedEvent = () => {
       if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
         const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-        if (SHOW_TIMING_MATH) console.log(`elapsed for truncate: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
+        if (SHOW_TIMING_MATH) {
+          console.log(`elapsed for truncate: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
+        }
 
         if (lastAssistantItem) {
           const truncateEvent = {
@@ -298,6 +302,7 @@ fastify.register(async (fastify) => {
           const text = response.transcript?.text || response.text || response.transcript || '';
           const itemId = response.item_id || response.item?.id;
           pushLine('user', text, response.type, { item_id: itemId });
+          persistTranscript(false); // guardado incremental (opcional)
         }
 
         // --- TRANSCRIPCIÓN DEL ASISTENTE (alineada al audio) ---
@@ -310,6 +315,7 @@ fastify.register(async (fastify) => {
           const rid = response.response_id || response.response?.id;
           const full = assistantOutAudioTranscript.get(rid);
           if (full) pushLine('assistant', full, 'response.audio_transcript.done', { response_id: rid });
+          persistTranscript(false); // incremental
         }
 
         // --- FALLBACK: TEXTO DEL ASISTENTE (por si no llega audio_transcript) ---
@@ -323,12 +329,13 @@ fastify.register(async (fastify) => {
           const full = assistantOutText.get(rid);
           if (full && !assistantOutAudioTranscript.get(rid)) {
             pushLine('assistant', full, response.type, { response_id: rid });
+            persistTranscript(false); // incremental
           }
         }
 
         // Al finalizar una respuesta completa, puedes forzar persistencia
         if (response.type === 'response.done') {
-          persistTranscriptIfReady();
+          persistTranscript(false);
         }
 
       } catch (error) {
@@ -357,7 +364,9 @@ fastify.register(async (fastify) => {
 
           case 'start': {
             streamSid = data.start.streamSid;
-            callSid = data.start.callSid || callSid; // útil para nombrar archivos
+            callSid = data.start.callSid || callSid;
+            if (callSid) sessionId = callSid; // a partir de aquí, el archivo se nombra por callSid
+            callStartedAt = new Date();
             console.log('Incoming stream started', { streamSid, callSid });
 
             // Reset
@@ -372,9 +381,9 @@ fastify.register(async (fastify) => {
           }
 
           case 'stop': {
+            callEndedAt = new Date();
             console.log('Twilio stream stopped', { streamSid, callSid });
-            // Al final de la llamada guardamos la conversación
-            persistTranscriptIfReady();
+            persistTranscript(true); // volcado final
             break;
           }
 
@@ -395,13 +404,17 @@ fastify.register(async (fastify) => {
 
     connection.on('close', () => {
       console.log('Twilio client disconnected.');
+      if (!callEndedAt) {
+        callEndedAt = new Date();
+        persistTranscript(true);
+      }
       safeClose();
     });
 
+    openAiWs.on('open', () => {});
     openAiWs.on('close', () => {
       console.log('Disconnected from OpenAI Realtime API');
     });
-
     openAiWs.on('error', (error) => {
       console.error('OpenAI WebSocket error:', error);
       safeClose();
@@ -409,6 +422,27 @@ fastify.register(async (fastify) => {
   });
 });
 
+// ───────────────────────────────────────────────────────────────────────────────
+// ENDPOINTS para transcripciones
+
+// Descargar una transcripción por callSid (o sessionId si no hubo callSid)
+fastify.get('/transcripts/:id', async (req, reply) => {
+  const base = path.join(TRANSCRIPTS_DIR, req.params.id);
+  const file = `${base}.json`;
+  if (!fs.existsSync(file)) return reply.code(404).send({ error: 'Not found' });
+  reply.header('Content-Type', 'application/json; charset=utf-8');
+  return fs.createReadStream(file);
+});
+
+// Listar transcripciones disponibles
+fastify.get('/transcripts', async (_req, reply) => {
+  const files = fs.readdirSync(TRANSCRIPTS_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => ({ id: f.replace(/\.json$/, ''), file: f }));
+  reply.send({ count: files.length, transcripts: files });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
 // Arranque del servidor
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   if (err) {
@@ -417,5 +451,6 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   }
   console.log(`Server listening on ${address}`);
   console.log(`POST /incoming-call  → configura tu número Twilio`);
-  console.log(`Transcripts folder   → ${TRANSCRIPTS_DIR}`);
+  console.log(`GET  /transcripts     → lista de transcripciones`);
+  console.log(`GET  /transcripts/:id → descarga JSON de una transcripción`);
 });
