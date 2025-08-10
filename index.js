@@ -4,6 +4,7 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import fs from 'fs'; // <- agregado: uso síncrono para el dump opcional
 
 // =========================
 // Carga de entorno
@@ -36,7 +37,7 @@ const VOICE = OPENAI_VOICE || 'alloy';
 const PORT = process.env.PORT || 5050;
 
 // =========================
- // Logging (opcional)
+// Logging (opcional)
 // =========================
 const LOG_EVENT_TYPES = [
   'error',
@@ -362,12 +363,11 @@ fastify.register(async (fastify) => {
           if (!formatReady) {
             console.warn('Saltando frame de audio: formato aún no confirmado como g711_ulaw.');
           } else if (streamSid) {
-            // (Opcional) dump del primer chunk a archivo para debug
+            // Dump opcional del primer chunk para debug
             if (DEBUG_AUDIO_DUMP && !globalThis.__dumpedFirstULaw) {
               try {
-                const fs = await import('fs');
-                const raw = Buffer.from(ev.delta, 'base64');
-                fs.writeFileSync('./debug_first_chunk.ul', raw);
+                const rawBuf = Buffer.from(ev.delta, 'base64');
+                fs.writeFileSync('./debug_first_chunk.ul', rawBuf);
                 console.log('Dumped first μ-law chunk to debug_first_chunk.ul');
                 globalThis.__dumpedFirstULaw = true;
               } catch {}
@@ -508,6 +508,17 @@ fastify.register(async (fastify) => {
       console.log('Client disconnected.');
     });
   });
+});
+
+// =========================
+// Arranque del servidor
+// =========================
+fastify.listen({ port: PORT }, (err) => {
+  if (err) {
+    console.error(err);
+    process.exit(1);
+  }
+  console.log(`Server is listening on port ${PORT}`);
 });
 
 
