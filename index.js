@@ -510,16 +510,6 @@ fastify.register(async (fastify) => {
   });
 });
 
-// =========================
-// Arranque del servidor
-// =========================
-fastify.listen({ port: PORT }, (err) => {
-  if (err) {
-    console.error(err);
-    process.exit(1);
-  }
-  console.log(`Server is listening on port ${PORT}`);
-});
 
 
 // =========================
