@@ -25,7 +25,7 @@ if (!OPENAI_API_KEY) {
 }
 
 // =========================
- // Config servidor
+// Config servidor
 // =========================
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
@@ -52,7 +52,6 @@ const SHOW_TIMING_MATH = false;
 
 // =========================
 // Definición de ENCUESTA
-//  (ajusta a tu guion)
 // =========================
 const SURVEY = {
   start: "consent",
@@ -84,7 +83,7 @@ const SURVEY = {
   }
 };
 
-// Herramienta para que el modelo reporte la respuesta normalizada y el siguiente paso
+// Herramienta para normalizar y avanzar
 const SURVEY_TOOL = [{
   type: "function",
   name: "report_answer",
@@ -125,7 +124,6 @@ fastify.get('/', async (request, reply) => {
   reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// TwiML: conecta el stream de la llamada al WebSocket /media-stream
 fastify.all('/incoming-call', async (request, reply) => {
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
@@ -137,7 +135,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 });
 
 // =========================
-// WebSocket de Media Stream
+ // WebSocket de Media Stream
 // =========================
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
@@ -158,12 +156,6 @@ fastify.register(async (fastify) => {
 
     // Helpers de encuesta
     function currentNode() { return SURVEY.nodes[survey.id]; }
-    function askText() { return currentNode().prompt; }
-
-    // Render simple ${slot} (si más adelante usas slots dinámicos)
-    function renderAsk(text, slots = {}) {
-      return (text || "").replace(/\$\{(\w+)\}/g, (_, k) => slots[k] || "");
-    }
 
     // Preguntar al usuario (voz) + habilitar tool calling
     function askQuestion() {
@@ -186,17 +178,17 @@ fastify.register(async (fastify) => {
       const msg = {
         type: "response.create",
         response: {
-          modalities: ["audio"],
+          // 👇 Debe ser ['audio','text'] si quieres voz
+          modalities: ["audio","text"],
           instructions,
           tools: SURVEY_TOOL,
           tool_choice: "auto"
-          // Nota: no establecer 'response.conversation' como arreglo; por defecto es 'auto'
         }
       };
       openAiWs.send(JSON.stringify(msg));
     }
 
-    // Aplicar respuesta del modelo y avanzar
+    // Aplicar respuesta y avanzar
     function applyAnswer(args = {}) {
       const qid = args.question_id || survey.id;
       survey.answers[qid] = {
@@ -205,7 +197,7 @@ fastify.register(async (fastify) => {
         confidence: typeof args.confidence === "number" ? args.confidence : null
       };
 
-      // Determinar siguiente id de forma segura
+      // Siguiente id
       let next = args.next_id;
       const node = SURVEY.nodes[qid];
       if (!next) {
@@ -227,7 +219,7 @@ fastify.register(async (fastify) => {
         openAiWs.send(JSON.stringify({
           type: "response.create",
           response: {
-            modalities: ["audio"],
+            modalities: ["audio","text"],
             instructions: SURVEY_SYSTEM + "\nPronuncia este mensaje final y nada más:\n" + SURVEY.nodes.end.prompt
           }
         }));
@@ -244,7 +236,7 @@ fastify.register(async (fastify) => {
       }
     });
 
-    // Inicializa la sesión Realtime (VAD servidor, μ-law) y arranca la encuesta
+    // Inicializa Realtime (VAD servidor, μ-law) y arranca la encuesta
     const initializeSession = () => {
       const sessionUpdate = {
         type: 'session.update',
@@ -254,10 +246,11 @@ fastify.register(async (fastify) => {
           output_audio_format: 'g711_ulaw',
           voice: VOICE,
           instructions: SURVEY_SYSTEM,
-          modalities: ["text", "audio"],
+          modalities: ["audio","text"],
           // 👇 Requerido: modelo de transcripción y lenguaje
           input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "es" },
-          temperature: 0.2
+          // 👇 El preview actual exige >= 0.6
+          temperature: 0.6
         }
       };
       console.log('Sending session update:', JSON.stringify(sessionUpdate));
@@ -322,7 +315,7 @@ fastify.register(async (fastify) => {
           console.log(`Received event: ${response.type}`, response);
         }
 
-        // Audio TTS del modelo → a Twilio Media Streams (μ-law base64)
+        // Audio TTS del modelo → Twilio (μ-law base64)
         if (response.type === 'response.audio.delta' && response.delta) {
           const audioDelta = {
             event: 'media',
@@ -349,14 +342,13 @@ fastify.register(async (fastify) => {
           handleSpeechStartedEvent();
         }
 
-        // Tool calling: acumulación de argumentos JSON
+        // Tool calling: acumula y procesa
         if (response.type === "response.function_call.arguments.delta") {
           const id = response.call_id;
           const prev = toolArgsBuffer.get(id) || "";
           toolArgsBuffer.set(id, prev + (response.delta || ""));
         }
 
-        // Tool calling: fin, parsea y aplica
         if (response.type === "response.function_call.arguments.done") {
           const id = response.call_id;
           const full = toolArgsBuffer.get(id) || "{}";
