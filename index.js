@@ -45,7 +45,8 @@ const LOG_EVENT_TYPES = [
   'input_audio_buffer.committed',
   'input_audio_buffer.speech_stopped',
   'input_audio_buffer.speech_started',
-  'session.created'
+  'session.created',
+  'session.updated'
 ];
 
 const SHOW_TIMING_MATH = false;
@@ -135,7 +136,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 });
 
 // =========================
- // WebSocket de Media Stream
+// WebSocket de Media Stream
 // =========================
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
@@ -145,14 +146,23 @@ fastify.register(async (fastify) => {
     let streamSid = null;
     let latestMediaTimestamp = 0;
     let lastAssistantItem = null;
-    let markQueue = [];
     let responseStartTimestampTwilio = null;
+
+    // Estado de TTS en vuelo (para barge-in)
+    let ttsInFlight = false;
+    let currentResponseId = null;
 
     // Estado de encuesta por llamada
     let survey = { id: SURVEY.start, answers: {} };
 
-    // Buffer para argumentos de tool calling
+    // Flags de sesión
+    let sessionReady = false;
+    let surveyStarted = false;
+
+    // Buffers para tool-calling y texto
     const toolArgsBuffer = new Map();
+    const asrBuffer = [];                       // transcripción usuario (entrada)
+    const modelTextBuffers = new Map();         // texto modelo por response_id
 
     // Helpers de encuesta
     function currentNode() { return SURVEY.nodes[survey.id]; }
@@ -178,13 +188,18 @@ fastify.register(async (fastify) => {
       const msg = {
         type: "response.create",
         response: {
-          // 👇 Debe ser ['audio','text'] si quieres voz
           modalities: ["audio","text"],
           instructions,
           tools: SURVEY_TOOL,
-          tool_choice: "auto"
+          tool_choice: "auto",
+          // Muy importante: ignora historial anterior en cada turno
+          conversation: "none"
         }
       };
+      ttsInFlight = false;           // se activará al primer delta
+      currentResponseId = null;
+      responseStartTimestampTwilio = null;
+      if (SHOW_TIMING_MATH) console.log('→ response.create (askQuestion) enviado');
       openAiWs.send(JSON.stringify(msg));
     }
 
@@ -215,14 +230,16 @@ fastify.register(async (fastify) => {
       if (survey.id !== "end") {
         askQuestion();
       } else {
-        // Mensaje de cierre
-        openAiWs.send(JSON.stringify({
+        // Mensaje de cierre (turno final)
+        const finalMsg = {
           type: "response.create",
           response: {
             modalities: ["audio","text"],
-            instructions: SURVEY_SYSTEM + "\nPronuncia este mensaje final y nada más:\n" + SURVEY.nodes.end.prompt
+            instructions: SURVEY_SYSTEM + "\nPronuncia este mensaje final y nada más:\n" + SURVEY.nodes.end.prompt,
+            conversation: "none"
           }
-        }));
+        };
+        openAiWs.send(JSON.stringify(finalMsg));
         // Persistencia (reemplaza por tu DB / webhook)
         console.log("RESPUESTAS ENCUESTA:", JSON.stringify(survey.answers, null, 2));
       }
@@ -236,121 +253,136 @@ fastify.register(async (fastify) => {
       }
     });
 
-    // Inicializa Realtime (VAD servidor, μ-law) y arranca la encuesta
-    const initializeSession = () => {
+    // Inicializa Realtime (VAD servidor, μ-law). Empezar encuesta SOLO tras ack.
+    const sendSessionUpdate = () => {
       const sessionUpdate = {
         type: 'session.update',
         session: {
-          turn_detection: { type: 'server_vad' },
+          turn_detection: {
+            type: 'server_vad',
+            // Parámetros ajustables de VAD para fluidez
+            silence_duration_ms: 200,
+            prefix_padding_ms: 200,
+            interrupt_response: true,
+            create_response: true
+          },
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           voice: VOICE,
           instructions: SURVEY_SYSTEM,
           modalities: ["audio","text"],
-          // 👇 Requerido: modelo de transcripción y lenguaje
           input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "es" },
-          // 👇 El preview actual exige >= 0.6
           temperature: 0.6
         }
       };
       console.log('Sending session update:', JSON.stringify(sessionUpdate));
       openAiWs.send(JSON.stringify(sessionUpdate));
-
-      // Arranque de encuesta
-      survey = { id: SURVEY.start, answers: {} };
-      askQuestion();
     };
 
     // ----- Barge-in: interrumpe TTS cuando el usuario habla -----
     const handleSpeechStartedEvent = () => {
-      if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+      if (!ttsInFlight) return;
+      if (SHOW_TIMING_MATH) console.log('BARGE-IN: speech_started → clear + truncate');
+
+      // Trunca item de audio del modelo según el tiempo reproducido
+      if (lastAssistantItem && responseStartTimestampTwilio != null) {
         const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-        if (SHOW_TIMING_MATH) {
-          console.log(`Calculando truncado: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
-        }
-
-        if (lastAssistantItem) {
-          const truncateEvent = {
-            type: 'conversation.item.truncate',
-            item_id: lastAssistantItem,
-            content_index: 0,
-            audio_end_ms: elapsedTime
-          };
-          if (SHOW_TIMING_MATH) console.log('Enviando truncate:', JSON.stringify(truncateEvent));
-          openAiWs.send(JSON.stringify(truncateEvent));
-        }
-
-        // Limpia el buffer de audio pendiente en Twilio
-        connection.send(JSON.stringify({ event: 'clear', streamSid }));
-        // Reset
-        markQueue = [];
-        lastAssistantItem = null;
-        responseStartTimestampTwilio = null;
+        const truncateEvent = {
+          type: 'conversation.item.truncate',
+          item_id: lastAssistantItem,
+          content_index: 0,
+          audio_end_ms: Math.max(0, elapsedTime)
+        };
+        openAiWs.send(JSON.stringify(truncateEvent));
       }
-    };
 
-    // Marca para saber cuándo Twilio terminó de reproducir el chunk
-    const sendMark = () => {
+      // Limpia el buffer de audio pendiente en Twilio
       if (streamSid) {
-        connection.send(JSON.stringify({
-          event: 'mark',
-          streamSid,
-          mark: { name: 'responsePart' }
-        }));
-        markQueue.push('responsePart');
+        connection.send(JSON.stringify({ event: 'clear', streamSid }));
       }
+
+      // Estado de TTS
+      ttsInFlight = false;
+      lastAssistantItem = null;
+      responseStartTimestampTwilio = null;
     };
 
     // ----- Eventos OpenAI WS -----
     openAiWs.on('open', () => {
       console.log('Connected to the OpenAI Realtime API');
-      setTimeout(initializeSession, 100);
+      setTimeout(sendSessionUpdate, 100);
     });
 
-    openAiWs.on('message', (data) => {
+    openAiWs.on('message', (raw) => {
       try {
-        const response = JSON.parse(data);
+        const ev = JSON.parse(raw);
 
-        if (LOG_EVENT_TYPES.includes(response.type)) {
-          console.log(`Received event: ${response.type}`, response);
+        if (LOG_EVENT_TYPES.includes(ev.type)) {
+          console.log(`Received event: ${ev.type}`, ev);
         }
 
-        // Audio TTS del modelo → Twilio (μ-law base64)
-        if (response.type === 'response.audio.delta' && response.delta) {
+        // Ack de sesión: recién aquí arrancamos la encuesta (una sola vez)
+        if ((ev.type === 'session.created' || ev.type === 'session.updated') && !sessionReady) {
+          sessionReady = true;
+          if (!surveyStarted) {
+            surveyStarted = true;
+            survey = { id: SURVEY.start, answers: {} };
+            askQuestion();
+          }
+        }
+
+        // Audio del modelo → Twilio (μ-law base64)
+        if (ev.type === 'response.audio.delta' && ev.delta) {
           const audioDelta = {
             event: 'media',
             streamSid,
-            media: { payload: response.delta }
+            media: { payload: ev.delta }
           };
           connection.send(JSON.stringify(audioDelta));
 
-          // Primer chunk de una nueva respuesta: referencia de tiempo
+          // Marcar estado de reproducción
           if (!responseStartTimestampTwilio) {
             responseStartTimestampTwilio = latestMediaTimestamp;
             if (SHOW_TIMING_MATH) console.log(`Start timestamp nueva respuesta: ${responseStartTimestampTwilio}ms`);
           }
+          if (ev.item_id) lastAssistantItem = ev.item_id;
+          ttsInFlight = true;
 
-          if (response.item_id) {
-            lastAssistantItem = response.item_id;
+          // Asignar id para marcar fin
+          currentResponseId = currentResponseId || ev.response_id || ev.item_id || 'resp';
+        }
+
+        // FIN de la salida de audio del modelo → enviar un 'mark' a Twilio (una sola vez)
+        if (
+          ev.type === 'response.audio.done' ||
+          ev.type === 'response.output_audio.done' ||
+          ev.type === 'response.done'
+        ) {
+          if (streamSid && currentResponseId) {
+            connection.send(JSON.stringify({
+              event: 'mark',
+              streamSid,
+              mark: { name: `end_${currentResponseId}` }
+            }));
           }
-
-          sendMark();
+          ttsInFlight = false;
+          currentResponseId = null;
         }
 
         // Barge-in (usuario empezó a hablar)
-        if (response.type === 'input_audio_buffer.speech_started') {
+        if (ev.type === 'input_audio_buffer.speech_started') {
           handleSpeechStartedEvent();
         }
 
         // Tool calling: acumula y procesa
-        if (response.type === "response.function_call.arguments.delta") {
-          const id = response.call_id;
+        if (ev.type === "response.function_call.arguments.delta") {
+          const id = ev.call_id;
           const prev = toolArgsBuffer.get(id) || "";
-          toolArgsBuffer.set(id, prev + (response.delta || ""));
+          toolArgsBuffer.set(id, prev + (ev.delta || ""));
         }
 
-        if (response.type === "response.function_call.arguments.done") {
-          const id = response.call_id;
+        if (ev.type === "response.function_call.arguments.done") {
+          const id = ev.call_id;
           const full = toolArgsBuffer.get(id) || "{}";
           toolArgsBuffer.delete(id);
 
@@ -359,8 +391,33 @@ fastify.register(async (fastify) => {
           applyAnswer(args);
         }
 
+        // ===== Transcripciones (ASR) =====
+        if (ev.type && ev.type.startsWith('input_audio_transcription')) {
+          // Algunas variantes traen transcript/text/delta
+          const piece = ev.transcript || ev.text || ev.delta || '';
+          if (piece) asrBuffer.push(piece);
+          if (ev.type.endsWith('completed') || ev.type.endsWith('done')) {
+            const finalAsr = asrBuffer.join('');
+            asrBuffer.length = 0;
+            console.log('ASR (usuario):', finalAsr);
+          }
+        }
+
+        // ===== Texto del modelo (además del audio) =====
+        if (ev.type === 'response.output_text.delta') {
+          const id = ev.response_id || 'default';
+          const prev = modelTextBuffers.get(id) || '';
+          modelTextBuffers.set(id, prev + (ev.delta || ''));
+        }
+        if (ev.type === 'response.output_text.done') {
+          const id = ev.response_id || 'default';
+          const txt = modelTextBuffers.get(id) || '';
+          modelTextBuffers.delete(id);
+          console.log('MODEL TEXT:', txt);
+        }
+
       } catch (error) {
-        console.error('Error processing OpenAI message:', error, 'Raw message:', data);
+        console.error('Error processing OpenAI message:', error, 'Raw:', raw);
       }
     });
 
@@ -398,7 +455,8 @@ fastify.register(async (fastify) => {
             break;
 
           case 'mark':
-            if (markQueue.length > 0) markQueue.shift();
+            // Twilio nos avisa cuando alcanzó la marca en reproducción
+            console.log('Twilio mark reached:', data.mark?.name);
             break;
 
           default:
