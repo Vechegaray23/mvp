@@ -5,9 +5,10 @@ import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 
-// Load environment variables from .env file
+// =========================
+// Carga de entorno
+// =========================
 dotenv.config();
-
 const envResult = dotenv.config({ debug: true, override: true });
 console.log('dotenv.config() →', envResult);
 console.log(
@@ -17,262 +18,413 @@ console.log(
   process.env.OPENAI_API_KEY?.length
 );
 
-// Retrieve the OpenAI API key from environment variables.
 const { OPENAI_API_KEY } = process.env;
-
 if (!OPENAI_API_KEY) {
-    console.error('Missing OpenAI API key. Please set it in the .env file.');
-    process.exit(1);
+  console.error('Missing OpenAI API key. Please set it in the .env file.');
+  process.exit(1);
 }
 
-// Initialize Fastify
+// =========================
+// Config servidor
+// =========================
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
-
 fastify.register(fastifyWs);
 
-// Constants
-const SYSTEM_MESSAGE = 'Eres un asistente que siempre habla español de IA servicial y efusivo que adora conversar sobre cualquier tema que interese al usuario y está preparado para ofrecerle datos. Tienes predilección por los chistes de papá, los chistes de búhos y por rickrollear de manera sutil. Mantente siempre positivo, pero introduce un chiste cuando corresponda.';
-
 const VOICE = 'alloy';
-const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
+const PORT = process.env.PORT || 5050;
 
-// List of Event Types to log to the console. See the OpenAI Realtime API Documentation: https://platform.openai.com/docs/api-reference/realtime
+// =========================
+// Logging (opcional)
+// =========================
 const LOG_EVENT_TYPES = [
-    'error',
-    'response.content.done',
-    'rate_limits.updated',
-    'response.done',
-    'input_audio_buffer.committed',
-    'input_audio_buffer.speech_stopped',
-    'input_audio_buffer.speech_started',
-    'session.created'
+  'error',
+  'response.content.done',
+  'rate_limits.updated',
+  'response.done',
+  'input_audio_buffer.committed',
+  'input_audio_buffer.speech_stopped',
+  'input_audio_buffer.speech_started',
+  'session.created'
 ];
 
-// Show AI response elapsed timing calculations
 const SHOW_TIMING_MATH = false;
 
-// Root Route
+// =========================
+// Definición de ENCUESTA
+//  (ajusta a tu guion)
+// =========================
+const SURVEY = {
+  start: "consent",
+  nodes: {
+    consent: {
+      prompt: "Para mejorar el servicio hacemos una encuesta breve de 3 minutos. ¿Aceptas participar? Responde sí o no.",
+      expect: "yesno",
+      next: { yes: "q1", no: "end" }
+    },
+    q1: {
+      prompt: "En una escala del 1 al 5, ¿qué tan satisfecho estás con nuestro servicio? Responde solo un número.",
+      expect: "number", range: [1,5],
+      next: "q2"
+    },
+    q2: {
+      prompt: "¿Cuál fue el motivo principal de tu calificación? Responde en una frase.",
+      expect: "text",
+      next: "q3"
+    },
+    q3: {
+      prompt: "¿Nos recomendarías a un amigo o colega? Responde sí o no.",
+      expect: "yesno",
+      next: "end"
+    },
+    end: {
+      prompt: "Gracias por responder. ¡Que tengas un buen día!",
+      expect: "none"
+    }
+  }
+};
+
+// Herramienta que el modelo usará para reportar la respuesta normalizada y el siguiente paso
+const SURVEY_TOOL = [{
+  type: "function",
+  name: "report_answer",
+  description: "Reporta la respuesta del usuario a la pregunta actual y el próximo id.",
+  parameters: {
+    type: "object",
+    properties: {
+      question_id: { type: "string" },
+      raw_text:    { type: "string", description: "Transcripción literal de la respuesta." },
+      normalized:  {
+        type: "object",
+        properties: {
+          yesno:  { type: ["string","null"], enum: ["yes","no",null] },
+          number: { type: ["number","null"] },
+          text:   { type: ["string","null"] }
+        },
+        additionalProperties: false
+      },
+      next_id:    { type: "string" },
+      confidence: { type: "number" }
+    },
+    required: ["question_id", "next_id"]
+  }
+}];
+
+// Instrucciones estrictas para modo encuesta
+const SURVEY_SYSTEM = [
+  "Eres un encuestador de voz. Sigue estrictamente el guion.",
+  "En cada turno: 1) pronuncia SOLO la pregunta actual, 2) escucha, 3) si hay respuesta válida, llama a la herramienta report_answer con question_id, raw_text, normalized y next_id.",
+  "No pronuncies JSON ni expliques el proceso. Si la respuesta es inválida, repregunta brevemente y vuelve a intentar.",
+  "Lenguaje claro y neutro; sin chistes; no improvises."
+].join("\n");
+
+// =========================
+// Rutas HTTP
+// =========================
 fastify.get('/', async (request, reply) => {
-    reply.send({ message: 'Twilio Media Stream Server is running!' });
+  reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// Route for Twilio to handle incoming calls
-// <Say> punctuation to improve text-to-speech translation
+// TwiML: conecta el stream de la llamada al WebSocket /media-stream
 fastify.all('/incoming-call', async (request, reply) => {
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-                          <Response>
-                              <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
-                              </Connect>
-                          </Response>`;
-
-    reply.type('text/xml').send(twimlResponse);
+  const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Connect>
+        <Stream url="wss://${request.headers.host}/media-stream" />
+      </Connect>
+    </Response>`;
+  reply.type('text/xml').send(twimlResponse);
 });
 
-// WebSocket route for media-stream
+// =========================
+// WebSocket de Media Stream
+// =========================
 fastify.register(async (fastify) => {
-    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-        console.log('Client connected');
+  fastify.get('/media-stream', { websocket: true }, (connection, req) => {
+    console.log('Client connected');
 
-        // Connection-specific state
-        let streamSid = null;
-        let latestMediaTimestamp = 0;
-        let lastAssistantItem = null;
-        let markQueue = [];
-        let responseStartTimestampTwilio = null;
+    // ----- Estado por conexión -----
+    let streamSid = null;
+    let latestMediaTimestamp = 0;
+    let lastAssistantItem = null;
+    let markQueue = [];
+    let responseStartTimestampTwilio = null;
 
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
-            headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                "OpenAI-Beta": "realtime=v1"
-            }
-        });
+    // Estado de encuesta por llamada
+    let survey = { id: SURVEY.start, answers: {} };
 
-        // Control initial session with OpenAI
-        const initializeSession = () => {
-            const sessionUpdate = {
-                type: 'session.update',
-                session: {
-                    turn_detection: { type: 'server_vad' },
-                    input_audio_format: 'g711_ulaw',
-                    output_audio_format: 'g711_ulaw',
-                    voice: VOICE,
-                    instructions: SYSTEM_MESSAGE,
-                    modalities: ["text", "audio"],
-                    temperature: 0.8,
-                }
-            };
+    // Buffer para argumentos de tool calling
+    const toolArgsBuffer = new Map();
 
-            console.log('Sending session update:', JSON.stringify(sessionUpdate));
-            openAiWs.send(JSON.stringify(sessionUpdate));
+    // Helpers de encuesta
+    function currentNode() { return SURVEY.nodes[survey.id]; }
+    function askText() { return currentNode().prompt; }
 
-            // Uncomment the following line to have AI speak first:
-            sendInitialConversationItem();
-        };
+    // Render simple ${slot} (si más adelante usas slots dinámicos)
+    function renderAsk(text, slots = {}) {
+      return (text || "").replace(/\$\{(\w+)\}/g, (_, k) => slots[k] || "");
+    }
 
-        // Send initial conversation item if AI talks first
-        const sendInitialConversationItem = () => {
-            const initialConversationItem = {
-                type: 'conversation.item.create',
-                item: {
-                    type: 'message',
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'input_text',
-                            text: 'Hola, necesito ayuda!'
-                        }
-                    ]
-                }
-            };
+    // Preguntar al usuario (voz) + habilitar tool calling
+    function askQuestion() {
+      const node = currentNode();
+      const controlFrame = {
+        question_id: survey.id,
+        expect: node.expect,
+        range: node.range || null,
+        next_map: node.next || null
+      };
+      const instructions = [
+        SURVEY_SYSTEM,
+        "Pregunta actual (no la leas literalmente como JSON):",
+        JSON.stringify(controlFrame)
+      ].join("\n");
 
-            if (SHOW_TIMING_MATH) console.log('Sending initial conversation item:', JSON.stringify(initialConversationItem));
-            openAiWs.send(JSON.stringify(initialConversationItem));
-            openAiWs.send(JSON.stringify({ type: 'response.create' }));
-        };
+      const msg = {
+        type: "response.create",
+        response: {
+          modalities: ["audio"],
+          instructions,
+          tools: SURVEY_TOOL,
+          tool_choice: "auto",
+          conversation: [{ role: "assistant", content: renderAsk(askText()) }]
+        }
+      };
+      openAiWs.send(JSON.stringify(msg));
+    }
 
-        // Handle interruption when the caller's speech starts
-        const handleSpeechStartedEvent = () => {
-            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-                if (SHOW_TIMING_MATH) console.log(`Calculating elapsed time for truncation: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
+    // Aplicar respuesta del modelo y avanzar
+    function applyAnswer(args = {}) {
+      const qid = args.question_id || survey.id;
+      survey.answers[qid] = {
+        raw_text: args.raw_text || null,
+        normalized: args.normalized || {},
+        confidence: typeof args.confidence === "number" ? args.confidence : null
+      };
 
-                if (lastAssistantItem) {
-                    const truncateEvent = {
-                        type: 'conversation.item.truncate',
-                        item_id: lastAssistantItem,
-                        content_index: 0,
-                        audio_end_ms: elapsedTime
-                    };
-                    if (SHOW_TIMING_MATH) console.log('Sending truncation event:', JSON.stringify(truncateEvent));
-                    openAiWs.send(JSON.stringify(truncateEvent));
-                }
+      // Determinar siguiente id de forma segura
+      let next = args.next_id;
+      const node = SURVEY.nodes[qid];
+      if (!next) {
+        if (node?.expect === "yesno" && node.next && args.normalized?.yesno) {
+          next = node.next[ args.normalized.yesno ] || "end";
+        } else if (node?.next) {
+          next = node.next;
+        } else {
+          next = "end";
+        }
+      }
 
-                connection.send(JSON.stringify({
-                    event: 'clear',
-                    streamSid: streamSid
-                }));
+      survey.id = next;
 
-                // Reset
-                markQueue = [];
-                lastAssistantItem = null;
-                responseStartTimestampTwilio = null;
-            }
-        };
+      if (survey.id !== "end") {
+        askQuestion();
+      } else {
+        // Mensaje de cierre
+        openAiWs.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio"],
+            instructions: SURVEY_SYSTEM,
+            conversation: [{ role: "assistant", content: SURVEY.nodes.end.prompt }]
+          }
+        }));
+        // Persistencia (reemplaza por tu DB)
+        console.log("RESPUESTAS ENCUESTA:", JSON.stringify(survey.answers, null, 2));
+      }
+    }
 
-        // Send mark messages to Media Streams so we know if and when AI response playback is finished
-        const sendMark = (connection, streamSid) => {
-            if (streamSid) {
-                const markEvent = {
-                    event: 'mark',
-                    streamSid: streamSid,
-                    mark: { name: 'responsePart' }
-                };
-                connection.send(JSON.stringify(markEvent));
-                markQueue.push('responsePart');
-            }
-        };
-
-        // Open event for OpenAI WebSocket
-        openAiWs.on('open', () => {
-            console.log('Connected to the OpenAI Realtime API');
-            setTimeout(initializeSession, 100);
-        });
-
-        // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
-        openAiWs.on('message', (data) => {
-            try {
-                const response = JSON.parse(data);
-
-                if (LOG_EVENT_TYPES.includes(response.type)) {
-                    console.log(`Received event: ${response.type}`, response);
-                }
-
-                if (response.type === 'response.audio.delta' && response.delta) {
-                    const audioDelta = {
-                        event: 'media',
-                        streamSid: streamSid,
-                        media: { payload: response.delta }
-                    };
-                    connection.send(JSON.stringify(audioDelta));
-
-                    // First delta from a new response starts the elapsed time counter
-                    if (!responseStartTimestampTwilio) {
-                        responseStartTimestampTwilio = latestMediaTimestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Setting start timestamp for new response: ${responseStartTimestampTwilio}ms`);
-                    }
-
-                    if (response.item_id) {
-                        lastAssistantItem = response.item_id;
-                    }
-                    
-                    sendMark(connection, streamSid);
-                }
-
-                if (response.type === 'input_audio_buffer.speech_started') {
-                    handleSpeechStartedEvent();
-                }
-            } catch (error) {
-                console.error('Error processing OpenAI message:', error, 'Raw message:', data);
-            }
-        });
-
-        // Handle incoming messages from Twilio
-        connection.on('message', (message) => {
-            try {
-                const data = JSON.parse(message);
-
-                switch (data.event) {
-                    case 'media':
-                        latestMediaTimestamp = data.media.timestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Received media message with timestamp: ${latestMediaTimestamp}ms`);
-                        if (openAiWs.readyState === WebSocket.OPEN) {
-                            const audioAppend = {
-                                type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            };
-                            openAiWs.send(JSON.stringify(audioAppend));
-                        }
-                        break;
-                    case 'start':
-                        streamSid = data.start.streamSid;
-                        console.log('Incoming stream has started', streamSid);
-
-                        // Reset start and media timestamp on a new stream
-                        responseStartTimestampTwilio = null; 
-                        latestMediaTimestamp = 0;
-                        break;
-                    case 'mark':
-                        if (markQueue.length > 0) {
-                            markQueue.shift();
-                        }
-                        break;
-                    default:
-                        console.log('Received non-media event:', data.event);
-                        break;
-                }
-            } catch (error) {
-                console.error('Error parsing message:', error, 'Message:', message);
-            }
-        });
-
-        // Handle connection close
-        connection.on('close', () => {
-            if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-            console.log('Client disconnected.');
-        });
-
-        // Handle WebSocket close and errors
-        openAiWs.on('close', () => {
-            console.log('Disconnected from the OpenAI Realtime API');
-        });
-
-        openAiWs.on('error', (error) => {
-            console.error('Error in the OpenAI WebSocket:', error);
-        });
+    // ----- Conexión a OpenAI Realtime -----
+    const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview', {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
     });
+
+    // Inicializa la sesión Realtime (VAD servidor, μ-law) y arranca la encuesta
+    const initializeSession = () => {
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          turn_detection: { type: 'server_vad' },
+          input_audio_format: 'g711_ulaw',
+          output_audio_format: 'g711_ulaw',
+          voice: VOICE,
+          instructions: SURVEY_SYSTEM,
+          modalities: ["text", "audio"],
+          input_audio_transcription: { enabled: true },
+          temperature: 0.2
+        }
+      };
+      console.log('Sending session update:', JSON.stringify(sessionUpdate));
+      openAiWs.send(JSON.stringify(sessionUpdate));
+
+      // Arranque de encuesta
+      survey = { id: SURVEY.start, answers: {} };
+      askQuestion();
+    };
+
+    // ----- Barge-in: interrumpe TTS cuando el usuario habla -----
+    const handleSpeechStartedEvent = () => {
+      if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+        const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
+        if (SHOW_TIMING_MATH) {
+          console.log(`Calculando truncado: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
+        }
+
+        if (lastAssistantItem) {
+          const truncateEvent = {
+            type: 'conversation.item.truncate',
+            item_id: lastAssistantItem,
+            content_index: 0,
+            audio_end_ms: elapsedTime
+          };
+          if (SHOW_TIMING_MATH) console.log('Enviando truncate:', JSON.stringify(truncateEvent));
+          openAiWs.send(JSON.stringify(truncateEvent));
+        }
+
+        // Limpia el buffer de audio pendiente en Twilio
+        connection.send(JSON.stringify({ event: 'clear', streamSid }));
+        // Reset
+        markQueue = [];
+        lastAssistantItem = null;
+        responseStartTimestampTwilio = null;
+      }
+    };
+
+    // Marca para saber cuándo Twilio terminó de reproducir el chunk
+    const sendMark = () => {
+      if (streamSid) {
+        connection.send(JSON.stringify({
+          event: 'mark',
+          streamSid,
+          mark: { name: 'responsePart' }
+        }));
+        markQueue.push('responsePart');
+      }
+    };
+
+    // ----- Eventos OpenAI WS -----
+    openAiWs.on('open', () => {
+      console.log('Connected to the OpenAI Realtime API');
+      setTimeout(initializeSession, 100);
+    });
+
+    openAiWs.on('message', (data) => {
+      try {
+        const response = JSON.parse(data);
+
+        if (LOG_EVENT_TYPES.includes(response.type)) {
+          console.log(`Received event: ${response.type}`, response);
+        }
+
+        // Audio TTS del modelo → a Twilio Media Streams (μ-law base64)
+        if (response.type === 'response.audio.delta' && response.delta) {
+          const audioDelta = {
+            event: 'media',
+            streamSid,
+            media: { payload: response.delta }
+          };
+          connection.send(JSON.stringify(audioDelta));
+
+          // Primer chunk de una nueva respuesta: referencia de tiempo
+          if (!responseStartTimestampTwilio) {
+            responseStartTimestampTwilio = latestMediaTimestamp;
+            if (SHOW_TIMING_MATH) console.log(`Start timestamp nueva respuesta: ${responseStartTimestampTwilio}ms`);
+          }
+
+          if (response.item_id) {
+            lastAssistantItem = response.item_id;
+          }
+
+          sendMark();
+        }
+
+        // Barge-in (usuario empezó a hablar)
+        if (response.type === 'input_audio_buffer.speech_started') {
+          handleSpeechStartedEvent();
+        }
+
+        // Tool calling: acumulación de argumentos JSON
+        if (response.type === "response.function_call.arguments.delta") {
+          const id = response.call_id;
+          const prev = toolArgsBuffer.get(id) || "";
+          toolArgsBuffer.set(id, prev + (response.delta || ""));
+        }
+
+        // Tool calling: fin, parsea y aplica
+        if (response.type === "response.function_call.arguments.done") {
+          const id = response.call_id;
+          const full = toolArgsBuffer.get(id) || "{}";
+          toolArgsBuffer.delete(id);
+
+          let args = {};
+          try { args = JSON.parse(full); } catch { /* noop */ }
+          applyAnswer(args);
+        }
+
+      } catch (error) {
+        console.error('Error processing OpenAI message:', error, 'Raw message:', data);
+      }
+    });
+
+    openAiWs.on('close', () => {
+      console.log('Disconnected from the OpenAI Realtime API');
+    });
+
+    openAiWs.on('error', (error) => {
+      console.error('Error in the OpenAI WebSocket:', error);
+    });
+
+    // ----- Eventos Twilio WS -----
+    connection.on('message', (message) => {
+      try {
+        const data = JSON.parse(message);
+
+        switch (data.event) {
+          case 'media':
+            latestMediaTimestamp = data.media.timestamp;
+            if (SHOW_TIMING_MATH) console.log(`Media ts: ${latestMediaTimestamp}ms`);
+            if (openAiWs.readyState === WebSocket.OPEN) {
+              openAiWs.send(JSON.stringify({
+                type: 'input_audio_buffer.append',
+                audio: data.media.payload
+              }));
+            }
+            break;
+
+          case 'start':
+            streamSid = data.start.streamSid;
+            console.log('Incoming stream has started', streamSid);
+            // Reset tiempos
+            responseStartTimestampTwilio = null;
+            latestMediaTimestamp = 0;
+            break;
+
+          case 'mark':
+            if (markQueue.length > 0) markQueue.shift();
+            break;
+
+          default:
+            console.log('Received non-media event:', data.event);
+            break;
+        }
+      } catch (error) {
+        console.error('Error parsing message:', error, 'Message:', message);
+      }
+    });
+
+    connection.on('close', () => {
+      if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
+      console.log('Client disconnected.');
+    });
+  });
 });
+
+// =========================
+// Arranque del servidor
+// =========================
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
     if (err) {
