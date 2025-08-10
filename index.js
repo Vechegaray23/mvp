@@ -210,7 +210,7 @@ fastify.register(async (fastify) => {
       }
 
       // Si quieres que la IA hable primero, descomenta:
-      // sendInitialConversationItem();
+      sendInitialConversationItem();
     };
 
     // Opcional: IA habla primero
@@ -220,7 +220,7 @@ fastify.register(async (fastify) => {
         item: {
           type: 'message',
           role: 'user',
-          content: [{ type: 'input_text', text: 'Hola, necesito ayuda.' }]
+          content: [{ type: 'input_text', text: 'Da un saludo inicial cordial y amistosa' }]
         }
       };
       if (openAiWs.readyState === WebSocket.OPEN) {
