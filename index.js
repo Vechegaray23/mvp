@@ -35,6 +35,11 @@ const nowIso = () => new Date().toISOString();
 const newSessionId = () => `S_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 // ───────────────────────────────────────────────────────────────────────────────
+// Flags de logging a consola para transcripciones
+const PRINT_TRANSCRIPT_INCREMENTAL_TO_CONSOLE = false; // true → imprime en cada guardado parcial
+const PRINT_TRANSCRIPT_FINAL_TO_CONSOLE = true;        // true → imprime al terminar la llamada
+
+// ───────────────────────────────────────────────────────────────────────────────
 // Configuración del asistente
 const VOICE = 'alloy'; // slug válido de voz
 const SYSTEM_MESSAGE =
@@ -124,9 +129,10 @@ fastify.register(async (fastify) => {
       transcript.push(line);
       if (role === 'user') stats.userTurns += 1;
       if (role === 'assistant') stats.assistantTurns += 1;
-      // No imprimir contenido en consola para evitar ruido.
+      // No imprimir contenido en consola aquí para evitar ruido.
     };
 
+    // ── Persistencia + impresión en consola ────────────────────────────────────
     const persistTranscript = (final = false) => {
       const startedAt = callStartedAt ? callStartedAt.toISOString() : (transcript[0]?.ts || nowIso());
       const endedAt = final ? (callEndedAt ? callEndedAt.toISOString() : nowIso()) : null;
@@ -146,6 +152,20 @@ fastify.register(async (fastify) => {
         fs.writeFileSync(`${basePath()}.json`, JSON.stringify(payload, null, 2), 'utf8');
       } catch (e) {
         console.error('Error escribiendo transcript JSON:', e);
+      }
+
+      const shouldPrint =
+        (final && PRINT_TRANSCRIPT_FINAL_TO_CONSOLE) ||
+        (!final && PRINT_TRANSCRIPT_INCREMENTAL_TO_CONSOLE);
+
+      if (shouldPrint) {
+        try {
+          console.log('──── TRANSCRIPT JSON ─────────────────────────────────────────────');
+          console.log(JSON.stringify(payload, null, 2));
+          console.log('──────────────────────────────────────────────────────────────────');
+        } catch (e) {
+          console.error('Error imprimiendo transcript JSON en consola:', e);
+        }
       }
     };
 
@@ -383,7 +403,7 @@ fastify.register(async (fastify) => {
           case 'stop': {
             callEndedAt = new Date();
             console.log('Twilio stream stopped', { streamSid, callSid });
-            persistTranscript(true); // volcado final
+            persistTranscript(true); // volcado final + impresión según flag
             break;
           }
 
@@ -411,7 +431,6 @@ fastify.register(async (fastify) => {
       safeClose();
     });
 
-    openAiWs.on('open', () => {});
     openAiWs.on('close', () => {
       console.log('Disconnected from OpenAI Realtime API');
     });
