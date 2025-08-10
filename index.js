@@ -25,7 +25,7 @@ if (!OPENAI_API_KEY) {
 }
 
 // =========================
-// Config servidor
+ // Config servidor
 // =========================
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
@@ -84,7 +84,7 @@ const SURVEY = {
   }
 };
 
-// Herramienta que el modelo usará para reportar la respuesta normalizada y el siguiente paso
+// Herramienta para que el modelo reporte la respuesta normalizada y el siguiente paso
 const SURVEY_TOOL = [{
   type: "function",
   name: "report_answer",
@@ -174,10 +174,13 @@ fastify.register(async (fastify) => {
         range: node.range || null,
         next_map: node.next || null
       };
+
       const instructions = [
         SURVEY_SYSTEM,
-        "Pregunta actual (no la leas literalmente como JSON):",
-        JSON.stringify(controlFrame)
+        "Control de la pregunta actual (NO lo pronuncies):",
+        JSON.stringify(controlFrame),
+        "Pronuncia exactamente la siguiente pregunta y nada más:",
+        node.prompt
       ].join("\n");
 
       const msg = {
@@ -186,8 +189,8 @@ fastify.register(async (fastify) => {
           modalities: ["audio"],
           instructions,
           tools: SURVEY_TOOL,
-          tool_choice: "auto",
-          conversation: [{ role: "assistant", content: renderAsk(askText()) }]
+          tool_choice: "auto"
+          // Nota: no establecer 'response.conversation' como arreglo; por defecto es 'auto'
         }
       };
       openAiWs.send(JSON.stringify(msg));
@@ -225,11 +228,10 @@ fastify.register(async (fastify) => {
           type: "response.create",
           response: {
             modalities: ["audio"],
-            instructions: SURVEY_SYSTEM,
-            conversation: [{ role: "assistant", content: SURVEY.nodes.end.prompt }]
+            instructions: SURVEY_SYSTEM + "\nPronuncia este mensaje final y nada más:\n" + SURVEY.nodes.end.prompt
           }
         }));
-        // Persistencia (reemplaza por tu DB)
+        // Persistencia (reemplaza por tu DB / webhook)
         console.log("RESPUESTAS ENCUESTA:", JSON.stringify(survey.answers, null, 2));
       }
     }
@@ -253,7 +255,8 @@ fastify.register(async (fastify) => {
           voice: VOICE,
           instructions: SURVEY_SYSTEM,
           modalities: ["text", "audio"],
-          input_audio_transcription: { enabled: true },
+          // 👇 Requerido: modelo de transcripción y lenguaje
+          input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "es" },
           temperature: 0.2
         }
       };
